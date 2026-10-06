@@ -6,7 +6,7 @@
 #include <sys/socket.h>
 
 #define PORT 9410
-#define AUTH_TOKEN "TOKEN_851"
+#define AUTH_TOKEN "OPS-2851"
 
 int main() {
     int server_fd, new_socket;
