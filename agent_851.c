@@ -58,6 +58,72 @@ int send_text(int sock, const char *message) {
     return 0;
 }
 
+/*
+ * Execute only one of the five commands allowed by the assignment.
+ */
+int execute_whitelisted_command(const char *command,
+                                 char *output,
+                                 size_t output_size) {
+    const char *shell_command = NULL;
+
+    if (strcmp(command, "DATE") == 0) {
+        shell_command = "date";
+    }
+    else if (strcmp(command, "UPTIME") == 0) {
+        shell_command = "uptime -p";
+    }
+    else if (strcmp(command, "DISKFREE") == 0) {
+        shell_command = "df -h / | tail -n 1";
+    }
+    else if (strcmp(command, "HOSTNAME") == 0) {
+        shell_command = "hostname";
+    }
+    else if (strcmp(command, "WHOAMI") == 0) {
+        shell_command = "whoami";
+    }
+    else {
+        return -2;
+    }
+
+    FILE *file = popen(shell_command, "r");
+
+    if (file == NULL) {
+        return -1;
+    }
+
+    size_t used = fread(output,
+                        1,
+                        output_size - 1,
+                        file);
+
+    output[used] = '\0';
+
+    pclose(file);
+
+    /*
+     * The RemoteOps protocol requires one-line responses.
+     * Remove newlines produced by the shell commands.
+     */
+    for (size_t i = 0; i < used; i++) {
+        if (output[i] == '\n' ||
+            output[i] == '\r') {
+            output[i] = ' ';
+        }
+    }
+
+    /*
+     * Remove trailing spaces.
+     */
+    while (used > 0 &&
+           (output[used - 1] == ' ' ||
+            output[used - 1] == '\t')) {
+        output[used - 1] = '\0';
+        used--;
+    }
+
+    return 0;
+}
+
 int get_sysinfo(char *response, size_t response_size) {
     FILE *file;
     double uptime;
@@ -65,7 +131,6 @@ int get_sysinfo(char *response, size_t response_size) {
     long mem_total_kb = 0;
     long mem_available_kb = 0;
 
-    /* Read 1-minute CPU load average */
     file = fopen("/proc/loadavg", "r");
 
     if (file == NULL) {
@@ -79,7 +144,6 @@ int get_sysinfo(char *response, size_t response_size) {
 
     fclose(file);
 
-    /* Read memory information */
     file = fopen("/proc/meminfo", "r");
 
     if (file == NULL) {
@@ -99,7 +163,6 @@ int get_sysinfo(char *response, size_t response_size) {
 
     fclose(file);
 
-    /* Read system uptime */
     file = fopen("/proc/uptime", "r");
 
     if (file == NULL) {
@@ -222,7 +285,7 @@ void *handle_client(void *arg) {
     if (strcmp(buffer, expected_auth) == 0) {
         printf("Authentication successful. Ready for commands.\n");
 
-        char response[256];
+        char response[8192];
 
         snprintf(response,
                  sizeof(response),
@@ -248,11 +311,18 @@ void *handle_client(void *arg) {
 
             printf("Received command: %s\n", buffer);
 
+            /*
+             * Temporary exit handling.
+             * QUIT will be implemented later.
+             */
             if (strcmp(buffer, "exit") == 0) {
                 printf("Controller disconnected.\n");
                 break;
             }
 
+            /*
+             * SYSINFO
+             */
             if (strcmp(buffer, "SYSINFO") == 0) {
                 char sysinfo_response[512];
 
@@ -275,6 +345,9 @@ void *handle_client(void *arg) {
                 continue;
             }
 
+            /*
+             * LISTPROC
+             */
             if (strcmp(buffer, "LISTPROC") == 0) {
                 char process_response[BUFFER_SIZE];
 
@@ -298,41 +371,100 @@ void *handle_client(void *arg) {
             }
 
             /*
-             * Temporary command execution.
-             * This will be replaced by the required EXEC whitelist.
+             * EXEC command.
              */
-            FILE *fp = popen(buffer, "r");
+            if (strncmp(buffer, "EXEC ", 5) == 0) {
+                char command_name[64];
 
-            if (fp == NULL) {
-                snprintf(response,
-                         sizeof(response),
-                         "ERR 003 COMMAND_FAILED %s\n",
-                         SID_TAG);
+                if (sscanf(buffer + 5,
+                           "%63s",
+                           command_name) != 1) {
 
-                send_text(new_socket, response);
+                    snprintf(response,
+                             sizeof(response),
+                             "ERR 002 COMMAND_NOT_ALLOWED %s\n",
+                             SID_TAG);
+
+                    send_text(new_socket,
+                              response);
+
+                    continue;
+                }
+
+                /*
+                 * Reject anything with extra arguments.
+                 * Example:
+                 * EXEC DATE something
+                 */
+                char extra[64];
+
+                if (sscanf(buffer + 5,
+                           "%63s %63s",
+                           command_name,
+                           extra) == 2) {
+
+                    snprintf(response,
+                             sizeof(response),
+                             "ERR 002 COMMAND_NOT_ALLOWED %s\n",
+                             SID_TAG);
+
+                    send_text(new_socket,
+                              response);
+
+                    continue;
+                }
+
+                char output[4096];
+
+                int result =
+                    execute_whitelisted_command(command_name,
+                                                output,
+                                                sizeof(output));
+
+                if (result == -2) {
+                    snprintf(response,
+                             sizeof(response),
+                             "ERR 002 COMMAND_NOT_ALLOWED %s\n",
+                             SID_TAG);
+
+                    send_text(new_socket,
+                              response);
+                }
+                else if (result == -1) {
+                    snprintf(response,
+                             sizeof(response),
+                             "ERR 003 COMMAND_EXECUTION_FAILED %s\n",
+                             SID_TAG);
+
+                    send_text(new_socket,
+                              response);
+                }
+                else {
+                    snprintf(response,
+                             sizeof(response),
+                             "OK EXEC_RESULT %s %s\n",
+                             output,
+                             SID_TAG);
+
+                    send_text(new_socket,
+                              response);
+                }
+
                 continue;
             }
 
-            char output[4096] = {0};
+            /*
+             * Any command not defined by the current protocol
+             * is rejected.
+             */
+            snprintf(response,
+                     sizeof(response),
+                     "ERR 002 COMMAND_NOT_ALLOWED %s\n",
+                     SID_TAG);
 
-            int bytes_read =
-                (int)fread(output,
-                           1,
-                           sizeof(output) - 1,
-                           fp);
-
-            if (bytes_read > 0) {
-                output[bytes_read] = '\0';
-                send_text(new_socket, output);
-            }
-            else {
-                send_text(new_socket,
-                          "(Command executed without output)\n");
-            }
-
-            pclose(fp);
+            send_text(new_socket,
+                      response);
         }
-
     }
     else {
         printf("Authentication failed. Dropping connection.\n");
@@ -344,7 +476,8 @@ void *handle_client(void *arg) {
                  "ERR 001 AUTH_FAILED %s\n",
                  SID_TAG);
 
-        send_text(new_socket, response);
+        send_text(new_socket,
+                  response);
     }
 
     close(new_socket);
