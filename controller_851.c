@@ -4,13 +4,24 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <pthread.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <errno.h>
 
 #define PORT 9410
 #define AUTH_TOKEN "OPS-2851"
 #define SID_TAG "SID:1582"
 
 #define BUFFER_SIZE 65536
+
+typedef struct {
+    int active;
+    int running;
+    int udp_sock;
+    pthread_t thread_id;
+    pthread_mutex_t mutex;
+} UDPReceiver;
 
 int recv_line(int sock, char *buffer, size_t size) {
     size_t i = 0;
@@ -39,10 +50,7 @@ int recv_line(int sock, char *buffer, size_t size) {
     return (int)i;
 }
 
-int send_all(int sock,
-             const void *data,
-             size_t length) {
-
+int send_all(int sock, const void *data, size_t length) {
     size_t total = 0;
 
     while (total < length) {
@@ -62,18 +70,11 @@ int send_all(int sock,
     return 0;
 }
 
-int send_text(int sock,
-              const char *message) {
-
-    return send_all(sock,
-                    message,
-                    strlen(message));
+int send_text(int sock, const char *message) {
+    return send_all(sock, message, strlen(message));
 }
 
-int recv_all(int sock,
-             void *buffer,
-             size_t length) {
-
+int recv_all(int sock, void *buffer, size_t length) {
     size_t total = 0;
 
     while (total < length) {
@@ -116,9 +117,218 @@ int is_safe_filename(const char *filename) {
     return 1;
 }
 
+/*
+ * UDP receiver thread.
+ *
+ * The socket uses a one-second receive timeout so the thread
+ * can regularly check whether monitoring is still active.
+ */
+void *udp_receiver_thread(void *arg) {
+    UDPReceiver *receiver =
+        (UDPReceiver *)arg;
+
+    char buffer[1024];
+
+    while (1) {
+        pthread_mutex_lock(&receiver->mutex);
+
+        int active = receiver->active;
+
+        pthread_mutex_unlock(&receiver->mutex);
+
+        if (!active) {
+            break;
+        }
+
+        ssize_t received =
+            recvfrom(receiver->udp_sock,
+                     buffer,
+                     sizeof(buffer) - 1,
+                     0,
+                     NULL,
+                     NULL);
+
+        if (received > 0) {
+            buffer[received] = '\0';
+
+            printf("UDP MONITOR: %s",
+                   buffer);
+
+            fflush(stdout);
+
+            continue;
+        }
+
+        if (received < 0) {
+            /*
+             * The one-second timeout is normal.
+             * Check active again and continue waiting.
+             */
+            if (errno == EAGAIN ||
+                errno == EWOULDBLOCK ||
+                errno == EINTR) {
+                continue;
+            }
+
+            break;
+        }
+
+        if (received == 0) {
+            continue;
+        }
+    }
+
+    return NULL;
+}
+
+int start_udp_receiver(UDPReceiver *receiver,
+                       int udp_port) {
+    pthread_mutex_lock(&receiver->mutex);
+
+    if (receiver->running) {
+        pthread_mutex_unlock(&receiver->mutex);
+        return -2;
+    }
+
+    pthread_mutex_unlock(&receiver->mutex);
+
+    if (udp_port < 1 ||
+        udp_port > 65535) {
+        return -3;
+    }
+
+    receiver->udp_sock =
+        socket(AF_INET,
+               SOCK_DGRAM,
+               0);
+
+    if (receiver->udp_sock < 0) {
+        perror("UDP socket creation failed");
+        return -1;
+    }
+
+    int opt = 1;
+
+    setsockopt(receiver->udp_sock,
+               SOL_SOCKET,
+               SO_REUSEADDR,
+               &opt,
+               sizeof(opt));
+
+    /*
+     * Use a one-second timeout so the receiver thread
+     * does not remain blocked forever when monitoring stops.
+     */
+    struct timeval timeout;
+
+    timeout.tv_sec = 1;
+    timeout.tv_usec = 0;
+
+    if (setsockopt(receiver->udp_sock,
+                   SOL_SOCKET,
+                   SO_RCVTIMEO,
+                   &timeout,
+                   sizeof(timeout)) < 0) {
+
+        perror("UDP receive timeout setup failed");
+
+        close(receiver->udp_sock);
+
+        receiver->udp_sock = -1;
+
+        return -1;
+    }
+
+    struct sockaddr_in address;
+
+    memset(&address,
+           0,
+           sizeof(address));
+
+    address.sin_family =
+        AF_INET;
+
+    address.sin_addr.s_addr =
+        INADDR_ANY;
+
+    address.sin_port =
+        htons((uint16_t)udp_port);
+
+    if (bind(receiver->udp_sock,
+             (struct sockaddr *)&address,
+             sizeof(address)) < 0) {
+
+        perror("UDP bind failed");
+
+        close(receiver->udp_sock);
+
+        receiver->udp_sock = -1;
+
+        return -1;
+    }
+
+    pthread_mutex_lock(&receiver->mutex);
+
+    receiver->active = 1;
+    receiver->running = 1;
+
+    pthread_mutex_unlock(&receiver->mutex);
+
+    if (pthread_create(&receiver->thread_id,
+                       NULL,
+                       udp_receiver_thread,
+                       receiver) != 0) {
+
+        perror("UDP receiver thread creation failed");
+
+        pthread_mutex_lock(&receiver->mutex);
+
+        receiver->active = 0;
+        receiver->running = 0;
+
+        pthread_mutex_unlock(&receiver->mutex);
+
+        close(receiver->udp_sock);
+
+        receiver->udp_sock = -1;
+
+        return -1;
+    }
+
+    printf("UDP receiver listening on port %d\n",
+           udp_port);
+
+    return 0;
+}
+
+void stop_udp_receiver(UDPReceiver *receiver) {
+    pthread_mutex_lock(&receiver->mutex);
+
+    int was_running =
+        receiver->running;
+
+    receiver->active = 0;
+
+    pthread_mutex_unlock(&receiver->mutex);
+
+    if (was_running) {
+        pthread_join(receiver->thread_id,
+                     NULL);
+
+        close(receiver->udp_sock);
+
+        receiver->udp_sock = -1;
+
+        pthread_mutex_lock(&receiver->mutex);
+
+        receiver->running = 0;
+
+        pthread_mutex_unlock(&receiver->mutex);
+    }
+}
+
 int handle_put(int sock,
                const char *filename) {
-
     if (!is_safe_filename(filename)) {
         printf("Invalid filename.\n");
         return 0;
@@ -126,7 +336,8 @@ int handle_put(int sock,
 
     struct stat file_stat;
 
-    if (stat(filename, &file_stat) != 0 ||
+    if (stat(filename,
+             &file_stat) != 0 ||
         !S_ISREG(file_stat.st_mode)) {
 
         printf("Local file not found: %s\n",
@@ -202,7 +413,6 @@ int handle_put(int sock,
 
 int handle_get(int sock,
                const char *filename) {
-
     if (!is_safe_filename(filename)) {
         printf("Invalid filename.\n");
         return 0;
@@ -217,7 +427,6 @@ int handle_get(int sock,
 
     if (send_text(sock,
                   command) < 0) {
-
         return -1;
     }
 
@@ -285,7 +494,8 @@ int handle_get(int sock,
 
     while (remaining > 0) {
         size_t chunk_size =
-            remaining > (long long)sizeof(file_buffer)
+            remaining >
+            (long long)sizeof(file_buffer)
             ? sizeof(file_buffer)
             : (size_t)remaining;
 
@@ -300,13 +510,15 @@ int handle_get(int sock,
         if (fwrite(file_buffer,
                    1,
                    chunk_size,
-                   file) != chunk_size) {
+                   file)
+            != chunk_size) {
 
             fclose(file);
             return -1;
         }
 
-        remaining -= (long long)chunk_size;
+        remaining -=
+            (long long)chunk_size;
     }
 
     fclose(file);
@@ -325,12 +537,24 @@ int main() {
 
     char buffer[BUFFER_SIZE];
 
+    UDPReceiver receiver;
+
+    receiver.active = 0;
+    receiver.running = 0;
+    receiver.udp_sock = -1;
+
+    pthread_mutex_init(&receiver.mutex,
+                       NULL);
+
     if ((sock =
          socket(AF_INET,
                 SOCK_STREAM,
                 0)) < 0) {
 
         printf("\nSocket creation error\n");
+
+        pthread_mutex_destroy(&receiver.mutex);
+
         return -1;
     }
 
@@ -345,6 +569,11 @@ int main() {
                   &serv_addr.sin_addr) <= 0) {
 
         printf("\nInvalid address/ Address not supported\n");
+
+        close(sock);
+
+        pthread_mutex_destroy(&receiver.mutex);
+
         return -1;
     }
 
@@ -353,6 +582,11 @@ int main() {
                 sizeof(serv_addr)) < 0) {
 
         printf("\nConnection Failed\n");
+
+        close(sock);
+
+        pthread_mutex_destroy(&receiver.mutex);
+
         return -1;
     }
 
@@ -370,7 +604,11 @@ int main() {
                   auth_message) < 0) {
 
         printf("Failed to send authentication request.\n");
+
         close(sock);
+
+        pthread_mutex_destroy(&receiver.mutex);
+
         return -1;
     }
 
@@ -380,8 +618,13 @@ int main() {
                   sizeof(buffer));
 
     if (valread <= 0) {
+
         printf("No response from Agent.\n");
+
         close(sock);
+
+        pthread_mutex_destroy(&receiver.mutex);
+
         return -1;
     }
 
@@ -389,10 +632,13 @@ int main() {
                "OK AUTHENTICATED SID:1582\n") != 0) {
 
         printf("Authentication failed. Disconnecting.\n");
+
         printf("Agent Response: %s",
                buffer);
 
         close(sock);
+
+        pthread_mutex_destroy(&receiver.mutex);
 
         return -1;
     }
@@ -424,12 +670,139 @@ int main() {
         }
 
         /*
-         * PUT filename
-         *
-         * The Controller determines the local file size
-         * and sends the exact protocol message:
-         *
-         * PUT filename filesize\n
+         * MONITOR START
+         */
+        if (strncmp(buffer,
+                    "MONITOR START ",
+                    14) == 0) {
+
+            char extra[64];
+
+            int udp_port;
+
+            int parsed =
+                sscanf(buffer + 14,
+                       "%d %63s",
+                       &udp_port,
+                       extra);
+
+            if (parsed != 1 ||
+                udp_port < 1 ||
+                udp_port > 65535) {
+
+                printf("Usage: MONITOR START <udp_port>\n");
+
+                continue;
+            }
+
+            int receiver_result =
+                start_udp_receiver(&receiver,
+                                   udp_port);
+
+            if (receiver_result == -2) {
+
+                printf("UDP monitoring is already active.\n");
+
+                continue;
+            }
+
+            if (receiver_result != 0) {
+
+                printf("Could not start local UDP receiver.\n");
+
+                continue;
+            }
+
+            char command[128];
+
+            snprintf(command,
+                     sizeof(command),
+                     "MONITOR START %d\n",
+                     udp_port);
+
+            if (send_text(sock,
+                          command) < 0) {
+
+                stop_udp_receiver(&receiver);
+
+                printf("Failed to send MONITOR START.\n");
+
+                break;
+            }
+
+            memset(buffer,
+                   0,
+                   sizeof(buffer));
+
+            valread =
+                recv_line(sock,
+                          buffer,
+                          sizeof(buffer));
+
+            if (valread <= 0) {
+
+                stop_udp_receiver(&receiver);
+
+                printf("Connection lost.\n");
+
+                break;
+            }
+
+            printf("%s",
+                   buffer);
+
+            if (strncmp(buffer,
+                        "OK MONITOR_STARTED",
+                        18) != 0) {
+
+                stop_udp_receiver(&receiver);
+            }
+
+            continue;
+        }
+
+        /*
+         * MONITOR STOP
+         */
+        if (strcmp(buffer,
+                   "MONITOR STOP") == 0) {
+
+            if (send_text(sock,
+                          "MONITOR STOP\n") < 0) {
+
+                printf("Failed to send MONITOR STOP.\n");
+
+                break;
+            }
+
+            memset(buffer,
+                   0,
+                   sizeof(buffer));
+
+            valread =
+                recv_line(sock,
+                          buffer,
+                          sizeof(buffer));
+
+            if (valread <= 0) {
+
+                stop_udp_receiver(&receiver);
+
+                printf("Connection lost.\n");
+
+                break;
+            }
+
+            printf("%s",
+                   buffer);
+
+            stop_udp_receiver(&receiver);
+
+            continue;
+        }
+
+        /*
+         * PUT
          */
         if (strncmp(buffer,
                     "PUT ",
@@ -446,12 +819,15 @@ int main() {
                        extra);
 
             if (parsed != 1) {
+
                 printf("Usage: PUT <filename>\n");
+
                 continue;
             }
 
             if (handle_put(sock,
                            filename) < 0) {
+
                 break;
             }
 
@@ -459,7 +835,7 @@ int main() {
         }
 
         /*
-         * GET filename
+         * GET
          */
         if (strncmp(buffer,
                     "GET ",
@@ -476,12 +852,15 @@ int main() {
                        extra);
 
             if (parsed != 1) {
+
                 printf("Usage: GET <filename>\n");
+
                 continue;
             }
 
             if (handle_get(sock,
                            filename) < 0) {
+
                 break;
             }
 
@@ -489,23 +868,26 @@ int main() {
         }
 
         /*
-         * Temporary exit handling.
-         * QUIT will be implemented later.
+         * Temporary exit.
          */
         if (strcmp(buffer,
                    "exit") == 0) {
 
             if (send_text(sock,
                           "exit\n") < 0) {
+
                 break;
             }
 
+            stop_udp_receiver(&receiver);
+
             printf("Disconnecting from Agent...\n");
+
             break;
         }
 
         /*
-         * Normal one-line command.
+         * Normal command.
          */
         if (send_text(sock,
                       buffer) < 0 ||
@@ -513,6 +895,7 @@ int main() {
                       "\n") < 0) {
 
             printf("Failed to send command.\n");
+
             break;
         }
 
@@ -526,16 +909,23 @@ int main() {
                       sizeof(buffer));
 
         if (valread > 0) {
+
             printf("%s",
                    buffer);
         }
         else {
+
             printf("Connection lost.\n");
+
             break;
         }
     }
 
+    stop_udp_receiver(&receiver);
+
     close(sock);
+
+    pthread_mutex_destroy(&receiver.mutex);
 
     return 0;
 }
