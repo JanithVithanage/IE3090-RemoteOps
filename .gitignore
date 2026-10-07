@@ -1,0 +1,18 @@
+# Compiled programs
+agent_851
+controller_851
+
+# Editor backup files
+*.save
+
+# Runtime file storage
+agentfiles/
+
+# Downloaded test files
+downloaded_*
+
+# Local authentication / secret files
+secret.txt
+
+# Runtime log
+remoteops_IT24102851.log
