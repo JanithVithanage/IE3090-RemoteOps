@@ -868,23 +868,48 @@ int main() {
         }
 
         /*
-         * Temporary exit.
+         * Handle the required QUIT command.
+         * Ask the Agent to terminate this session cleanly,
+         * wait for the goodbye response, then stop the
+         * local UDP receiver and close the connection.
          */
-        if (strcmp(buffer,
-                   "exit") == 0) {
 
-            if (send_text(sock,
-                          "exit\n") < 0) {
+         if (strcmp(buffer, "QUIT") == 0) {
 
-                break;
-            }
+              if (send_text(sock,
+                           "QUIT\n") < 0) {
 
-            stop_udp_receiver(&receiver);
+              printf("Failed to send QUIT command.\n");
+              break;
+              }
 
-            printf("Disconnecting from Agent...\n");
+              memset(buffer,
+                     0,
+                     sizeof(buffer));
 
-            break;
-        }
+              valread =
+                 recv_line(sock,
+                           buffer,
+                           sizeof(buffer));
+
+              if (valread <= 0) {
+
+                  stop_udp_receiver(&receiver);
+
+                  printf("Connection lost while quitting.\n");
+
+                  break;
+              }
+
+              printf("%s",
+                      buffer);
+
+              stop_udp_receiver(&receiver);
+
+              printf("Disconnecting from Agent...\n");
+
+              break;
+          }
 
         /*
          * Normal command.

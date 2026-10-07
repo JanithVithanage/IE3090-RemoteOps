@@ -833,18 +833,27 @@ void *handle_client(void *arg) {
                buffer);
 
         /*
-         * Temporary exit.
-         * QUIT will be made fully protocol-compliant later.
+         * Handle the required QUIT command.
+         * Stop any active monitoring, send the goodbye response,
+         * and then close this Controller session.
          */
-        if (strcmp(buffer,
-                   "exit") == 0) {
+        if (strcmp(buffer, "QUIT") == 0) {
 
             stop_monitor(&monitor);
 
-            printf("Controller disconnected.\n");
+            snprintf(response,
+                     sizeof(response),
+                     "OK BYE %s\n",
+                     SID_TAG);
+
+            send_text(new_socket,
+                      response);
+
+            printf("Controller requested QUIT.\n");
 
             break;
-        }
+         }
+
 
         /*
          * SYSINFO
