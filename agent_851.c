@@ -7,6 +7,7 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <time.h>
 
 #define PORT 9410
 #define AUTH_TOKEN "OPS-2851"
@@ -19,6 +20,8 @@
 #define STORAGE_ROOT "./agentfiles"
 #define STORAGE_DIR "./agentfiles/" REG_NUMBER
 
+#define LOG_FILE "remoteops_IT24102851.log"
+
 #define MONITOR_INTERVAL 5
 
 typedef struct {
@@ -30,11 +33,54 @@ typedef struct {
     pthread_mutex_t mutex;
 } MonitorContext;
 
-int recv_line(int sock, char *buffer, size_t size) {
+/*
+ * Global log file and mutex.
+ * The mutex prevents multiple Controller threads
+ * from writing to the log at the same time.
+ */
+FILE *log_file = NULL;
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void log_event(const char *event) {
+    time_t now;
+    struct tm time_info;
+    char timestamp[64];
+
+    time(&now);
+
+    localtime_r(&now, &time_info);
+
+    strftime(timestamp,
+             sizeof(timestamp),
+             "%Y-%m-%d %H:%M:%S",
+             &time_info);
+
+    pthread_mutex_lock(&log_mutex);
+
+    if (log_file != NULL) {
+        fprintf(log_file,
+                "[%s] %s\n",
+                timestamp,
+                event);
+
+        fflush(log_file);
+    }
+
+    pthread_mutex_unlock(&log_mutex);
+}
+
+int recv_line(int sock,
+              char *buffer,
+              size_t size) {
+
     size_t i = 0;
 
     while (i < size - 1) {
-        ssize_t n = recv(sock, &buffer[i], 1, 0);
+        ssize_t n =
+            recv(sock,
+                 &buffer[i],
+                 1,
+                 0);
 
         if (n == 0) {
             return 0;
@@ -53,10 +99,14 @@ int recv_line(int sock, char *buffer, size_t size) {
     }
 
     buffer[i] = '\0';
+
     return (int)i;
 }
 
-int send_all(int sock, const void *data, size_t length) {
+int send_all(int sock,
+             const void *data,
+             size_t length) {
+
     size_t total = 0;
 
     while (total < length) {
@@ -76,38 +126,26 @@ int send_all(int sock, const void *data, size_t length) {
     return 0;
 }
 
-int send_text(int sock, const char *message) {
-    return send_all(sock, message, strlen(message));
+int send_text(int sock,
+              const char *message) {
+
+    return send_all(sock,
+                    message,
+                    strlen(message));
 }
 
-int recv_all(int sock, void *buffer, size_t length) {
-    size_t total = 0;
+int discard_bytes(int sock,
+                  long long length) {
 
-    while (total < length) {
-        ssize_t received =
-            recv(sock,
-                 (char *)buffer + total,
-                 length - total,
-                 0);
-
-        if (received <= 0) {
-            return -1;
-        }
-
-        total += (size_t)received;
-    }
-
-    return 0;
-}
-
-int discard_bytes(int sock, long long length) {
     char buffer[4096];
 
     long long remaining = length;
 
     while (remaining > 0) {
+
         size_t chunk_size =
-            remaining > (long long)sizeof(buffer)
+            remaining >
+            (long long)sizeof(buffer)
             ? sizeof(buffer)
             : (size_t)remaining;
 
@@ -128,13 +166,16 @@ int discard_bytes(int sock, long long length) {
 }
 
 int is_safe_filename(const char *filename) {
+
     if (filename == NULL ||
         filename[0] == '\0') {
+
         return 0;
     }
 
     if (strcmp(filename, ".") == 0 ||
         strcmp(filename, "..") == 0) {
+
         return 0;
     }
 
@@ -144,15 +185,13 @@ int is_safe_filename(const char *filename) {
 
     if (strchr(filename, '/') != NULL ||
         strchr(filename, '\\') != NULL) {
+
         return 0;
     }
 
     return 1;
 }
 
-/*
- * Collect the current system statistics.
- */
 int get_system_stats(double *cpu_load,
                      long *mem_used_mb,
                      long *uptime_sec) {
@@ -164,25 +203,22 @@ int get_system_stats(double *cpu_load,
 
     double uptime;
 
-    /*
-     * CPU load from /proc/loadavg.
-     */
     file = fopen("/proc/loadavg", "r");
 
     if (file == NULL) {
         return -1;
     }
 
-    if (fscanf(file, "%lf", cpu_load) != 1) {
+    if (fscanf(file,
+               "%lf",
+               cpu_load) != 1) {
+
         fclose(file);
         return -1;
     }
 
     fclose(file);
 
-    /*
-     * Memory from /proc/meminfo.
-     */
     file = fopen("/proc/meminfo", "r");
 
     if (file == NULL) {
@@ -215,16 +251,16 @@ int get_system_stats(double *cpu_load,
 
     fclose(file);
 
-    /*
-     * Uptime from /proc/uptime.
-     */
     file = fopen("/proc/uptime", "r");
 
     if (file == NULL) {
         return -1;
     }
 
-    if (fscanf(file, "%lf", &uptime) != 1) {
+    if (fscanf(file,
+               "%lf",
+               &uptime) != 1) {
+
         fclose(file);
         return -1;
     }
@@ -269,9 +305,9 @@ int get_sysinfo(char *response,
 int get_process_list(char *response,
                      size_t response_size) {
 
-    FILE *file;
-
-    file = popen("ps -e -o pid=,comm=", "r");
+    FILE *file =
+        popen("ps -e -o pid=,comm=",
+              "r");
 
     if (file == NULL) {
         return -1;
@@ -283,9 +319,10 @@ int get_process_list(char *response,
 
     int first_process = 1;
 
-    used += snprintf(response + used,
-                     response_size - used,
-                     "OK PROCS ");
+    used +=
+        snprintf(response + used,
+                 response_size - used,
+                 "OK PROCS ");
 
     while (fgets(line,
                  sizeof(line),
@@ -299,6 +336,7 @@ int get_process_list(char *response,
                    "%d %127s",
                    &pid,
                    command) != 2) {
+
             continue;
         }
 
@@ -372,7 +410,8 @@ int execute_whitelisted_command(
     }
 
     FILE *file =
-        popen(shell_command, "r");
+        popen(shell_command,
+              "r");
 
     if (file == NULL) {
         return -1;
@@ -404,6 +443,7 @@ int execute_whitelisted_command(
             output[used - 1] == '\t')) {
 
         output[used - 1] = '\0';
+
         used--;
     }
 
@@ -411,6 +451,7 @@ int execute_whitelisted_command(
 }
 
 int monitor_is_active(MonitorContext *monitor) {
+
     int active;
 
     pthread_mutex_lock(&monitor->mutex);
@@ -430,6 +471,7 @@ void *monitor_thread(void *arg) {
     while (monitor_is_active(monitor)) {
 
         double cpu_load;
+
         long mem_used_mb;
         long uptime_sec;
 
@@ -458,10 +500,6 @@ void *monitor_thread(void *arg) {
                    packet);
         }
 
-        /*
-         * Sleep in one-second pieces so MONITOR STOP
-         * doesn't have to wait the full 5 seconds.
-         */
         for (int i = 0;
              i < MONITOR_INTERVAL;
              i++) {
@@ -484,13 +522,17 @@ int start_monitor(MonitorContext *monitor,
     pthread_mutex_lock(&monitor->mutex);
 
     if (monitor->running) {
+
         pthread_mutex_unlock(&monitor->mutex);
+
         return -2;
     }
 
     pthread_mutex_unlock(&monitor->mutex);
 
-    if (udp_port < 1 || udp_port > 65535) {
+    if (udp_port < 1 ||
+        udp_port > 65535) {
+
         return -3;
     }
 
@@ -573,6 +615,7 @@ void stop_monitor(MonitorContext *monitor) {
     pthread_mutex_unlock(&monitor->mutex);
 
     if (was_running) {
+
         pthread_join(monitor->thread_id,
                      NULL);
 
@@ -611,7 +654,8 @@ int handle_put(int new_socket,
              filename);
 
     FILE *file =
-        fopen(path, "wb");
+        fopen(path,
+              "wb");
 
     if (file == NULL) {
         return -1;
@@ -637,7 +681,9 @@ int handle_put(int new_socket,
                  0);
 
         if (received <= 0) {
+
             fclose(file);
+
             return -1;
         }
 
@@ -648,6 +694,7 @@ int handle_put(int new_socket,
             != (size_t)received) {
 
             fclose(file);
+
             return -1;
         }
 
@@ -687,7 +734,8 @@ int handle_get(int new_socket,
         (long long)file_stat.st_size;
 
     FILE *file =
-        fopen(path, "rb");
+        fopen(path,
+              "rb");
 
     if (file == NULL) {
         return -3;
@@ -706,6 +754,7 @@ int handle_get(int new_socket,
                   response) < 0) {
 
         fclose(file);
+
         return -1;
     }
 
@@ -724,6 +773,7 @@ int handle_get(int new_socket,
                      bytes_read) < 0) {
 
             fclose(file);
+
             return -1;
         }
     }
@@ -751,6 +801,28 @@ void *handle_client(void *arg) {
     pthread_mutex_init(&monitor.mutex,
                        NULL);
 
+    struct sockaddr_in client_address;
+
+    socklen_t client_length =
+        sizeof(client_address);
+
+    memset(&client_address,
+           0,
+           sizeof(client_address));
+
+    getpeername(new_socket,
+                (struct sockaddr *)&client_address,
+                &client_length);
+
+    char connection_log[256];
+
+    snprintf(connection_log,
+             sizeof(connection_log),
+             "CONNECTION from %s",
+             inet_ntoa(client_address.sin_addr));
+
+    log_event(connection_log);
+
     printf("Controller connected!\n");
 
     int valread =
@@ -759,6 +831,8 @@ void *handle_client(void *arg) {
                   sizeof(buffer));
 
     if (valread <= 0) {
+
+        log_event("DISCONNECT before authentication");
 
         printf("Controller disconnected before authentication.\n");
 
@@ -789,6 +863,8 @@ void *handle_client(void *arg) {
         send_text(new_socket,
                   response);
 
+        log_event("AUTH_FAILED");
+
         pthread_mutex_destroy(&monitor.mutex);
 
         close(new_socket);
@@ -797,6 +873,8 @@ void *handle_client(void *arg) {
     }
 
     printf("Authentication successful. Ready for commands.\n");
+
+    log_event("AUTH_SUCCESS SID:1582");
 
     char response[8192];
 
@@ -821,6 +899,10 @@ void *handle_client(void *arg) {
 
         if (cmd_read <= 0) {
 
+            stop_monitor(&monitor);
+
+            log_event("DISCONNECT SID:1582");
+
             printf("Controller disconnected.\n");
 
             break;
@@ -829,15 +911,28 @@ void *handle_client(void *arg) {
         buffer[strcspn(buffer,
                        "\n")] = '\0';
 
+        /*
+         * Log the received command.
+         * The command is limited to 950 characters in the
+         * log entry to avoid buffer truncation.
+         */
+        char command_log[1024];
+
+        snprintf(command_log,
+                 sizeof(command_log),
+                 "COMMAND: %.950s SID:1582",
+                 buffer);
+
+        log_event(command_log);
+
         printf("Received command: %s\n",
                buffer);
 
         /*
-         * Handle the required QUIT command.
-         * Stop any active monitoring, send the goodbye response,
-         * and then close this Controller session.
+         * QUIT
          */
-        if (strcmp(buffer, "QUIT") == 0) {
+        if (strcmp(buffer,
+                   "QUIT") == 0) {
 
             stop_monitor(&monitor);
 
@@ -849,11 +944,12 @@ void *handle_client(void *arg) {
             send_text(new_socket,
                       response);
 
+            log_event("QUIT SID:1582");
+
             printf("Controller requested QUIT.\n");
 
             break;
-         }
-
+        }
 
         /*
          * SYSINFO
@@ -1022,7 +1118,6 @@ void *handle_client(void *arg) {
 
                 if (discard_bytes(new_socket,
                                   file_size) < 0) {
-
                     break;
                 }
 
@@ -1041,7 +1136,6 @@ void *handle_client(void *arg) {
 
                 if (discard_bytes(new_socket,
                                   file_size) < 0) {
-
                     break;
                 }
 
@@ -1056,27 +1150,27 @@ void *handle_client(void *arg) {
                 continue;
             }
 
-            int put_result =
+            int result =
                 handle_put(new_socket,
                            filename,
                            file_size);
 
-            if (put_result == 0) {
+            if (result == 0) {
+
+                char file_log[512];
+
+                snprintf(file_log,
+                         sizeof(file_log),
+                         "PUT %s %lld bytes SID:1582",
+                         filename,
+                         file_size);
+
+                log_event(file_log);
 
                 snprintf(response,
                          sizeof(response),
                          "OK FILE_RECEIVED %s %s\n",
                          filename,
-                         SID_TAG);
-
-                send_text(new_socket,
-                          response);
-            }
-            else if (put_result == -2) {
-
-                snprintf(response,
-                         sizeof(response),
-                         "ERR 006 INVALID_FILENAME %s\n",
                          SID_TAG);
 
                 send_text(new_socket,
@@ -1126,11 +1220,11 @@ void *handle_client(void *arg) {
                 continue;
             }
 
-            int get_result =
+            int result =
                 handle_get(new_socket,
                            filename);
 
-            if (get_result == -2) {
+            if (result == -2) {
 
                 snprintf(response,
                          sizeof(response),
@@ -1140,7 +1234,7 @@ void *handle_client(void *arg) {
                 send_text(new_socket,
                           response);
             }
-            else if (get_result == -3) {
+            else if (result == -3) {
 
                 snprintf(response,
                          sizeof(response),
@@ -1150,12 +1244,38 @@ void *handle_client(void *arg) {
                 send_text(new_socket,
                           response);
             }
+            else if (result == 0) {
+
+                struct stat file_stat;
+
+                char path[512];
+
+                snprintf(path,
+                         sizeof(path),
+                         "%s/%s",
+                         STORAGE_DIR,
+                         filename);
+
+                if (stat(path,
+                         &file_stat) == 0) {
+
+                    char file_log[512];
+
+                    snprintf(file_log,
+                             sizeof(file_log),
+                             "GET %s %lld bytes SID:1582",
+                             filename,
+                             (long long)file_stat.st_size);
+
+                    log_event(file_log);
+                }
+            }
 
             continue;
         }
 
         /*
-         * MONITOR START <udp_port>
+         * MONITOR START
          */
         if (strncmp(buffer,
                     "MONITOR START ",
@@ -1207,6 +1327,15 @@ void *handle_client(void *arg) {
             }
             else {
 
+                char monitor_log[256];
+
+                snprintf(monitor_log,
+                         sizeof(monitor_log),
+                         "MONITOR_START UDP:%d SID:1582",
+                         udp_port);
+
+                log_event(monitor_log);
+
                 snprintf(response,
                          sizeof(response),
                          "OK MONITOR_STARTED %s\n",
@@ -1226,6 +1355,8 @@ void *handle_client(void *arg) {
                    "MONITOR STOP") == 0) {
 
             stop_monitor(&monitor);
+
+            log_event("MONITOR_STOP SID:1582");
 
             snprintf(response,
                      sizeof(response),
@@ -1261,11 +1392,15 @@ void *handle_client(void *arg) {
 
 int main() {
 
+    /*
+     * Create personalized file storage directory.
+     */
     if (mkdir(STORAGE_ROOT,
               0755) < 0 &&
         errno != EEXIST) {
 
         perror("Cannot create agentfiles directory");
+
         exit(EXIT_FAILURE);
     }
 
@@ -1274,8 +1409,25 @@ int main() {
         errno != EEXIST) {
 
         perror("Cannot create personalized storage directory");
+
         exit(EXIT_FAILURE);
     }
+
+    /*
+     * Open personalized activity log.
+     */
+    log_file =
+        fopen(LOG_FILE,
+              "a");
+
+    if (log_file == NULL) {
+
+        perror("Cannot open log file");
+
+        exit(EXIT_FAILURE);
+    }
+
+    log_event("AGENT_STARTED");
 
     int server_fd;
 
@@ -1294,6 +1446,9 @@ int main() {
     if (server_fd == -1) {
 
         perror("Socket creation failed");
+
+        fclose(log_file);
+
         exit(EXIT_FAILURE);
     }
 
@@ -1304,6 +1459,9 @@ int main() {
                    sizeof(opt))) {
 
         perror("setsockopt failed");
+
+        fclose(log_file);
+
         exit(EXIT_FAILURE);
     }
 
@@ -1321,6 +1479,9 @@ int main() {
              sizeof(address)) < 0) {
 
         perror("Bind failed");
+
+        fclose(log_file);
+
         exit(EXIT_FAILURE);
     }
 
@@ -1328,6 +1489,9 @@ int main() {
                10) < 0) {
 
         perror("Listen failed");
+
+        fclose(log_file);
+
         exit(EXIT_FAILURE);
     }
 
@@ -1336,6 +1500,9 @@ int main() {
 
     printf("File storage: %s\n",
            STORAGE_DIR);
+
+    printf("Activity log: %s\n",
+           LOG_FILE);
 
     while (1) {
 
@@ -1347,6 +1514,7 @@ int main() {
         if (new_socket < 0) {
 
             perror("Accept failed");
+
             continue;
         }
 
@@ -1356,7 +1524,9 @@ int main() {
         if (client_socket == NULL) {
 
             perror("Memory allocation failed");
+
             close(new_socket);
+
             continue;
         }
 
@@ -1373,6 +1543,7 @@ int main() {
             perror("Thread creation failed");
 
             close(new_socket);
+
             free(client_socket);
 
             continue;
@@ -1382,6 +1553,12 @@ int main() {
     }
 
     close(server_fd);
+
+    log_event("AGENT_STOPPED");
+
+    fclose(log_file);
+
+    pthread_mutex_destroy(&log_mutex);
 
     return 0;
 }
